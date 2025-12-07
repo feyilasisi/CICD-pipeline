@@ -1,0 +1,207 @@
+
+name: Merchant Dashboard API CD
+
+on:
+  push:
+    branches:
+      - staging_merchant_dashboard
+      - main_merchant_dashboard
+      
+
+jobs:
+  run-ci:
+    uses: ./.github/workflows/CI_optimized.yml
+    secrets:
+      SONAR_TOKEN_MERCH_DASH_API: ${{ secrets.SONAR_TOKEN_MERCH_DASH_API }}
+      SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+
+  deploy:
+    needs: run-ci
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      S3_BUCKET: novac-build-artifacts #constant
+      REPO_NAME: novac-merchant-API #for path to respective repo on s3
+      PROJECT_PATH: ./NovacMerchantAdmin.Api/NovacService.Api.csproj #var
+      MAIN_BRANCH: main_merchant_dashboard #vary per repo
+      STAGING_BRANCH: staging_merchant_dashboard #vary per repo
+      ENV_STAGE: staging #constant
+      ENV_PROD: prod #constant
+      EB_APP_NAME: novac-merchantapi-staging #vary per EB app name
+      EB_ENV_STAGE: Novac-merchantapi-staging-env #vary per EB environment name
+      EB_ENV_PROD: Novac-merchantapi-live-env #vary per EB environment name
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Set environment variables based on branch
+        id: set-env
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+
+          if [[ "${BRANCH_NAME}" == "$MAIN_BRANCH" ]]; then
+            echo "ENVIRONMENT=$ENV_PROD" >> $GITHUB_ENV
+            echo "EB_ENV_NAME=$EB_ENV_PROD" >> $GITHUB_ENV
+          elif [[ "${BRANCH_NAME}" == "$STAGING_BRANCH" ]]; then
+            echo "ENVIRONMENT=$ENV_STAGE" >> $GITHUB_ENV
+            echo "EB_ENV_NAME=$EB_ENV_STAGE" >> $GITHUB_ENV
+          fi
+
+          echo "APP_DIR=/home/ubuntu/novac-merchantapi" >> $GITHUB_ENV
+          # echo "PREV_DIR=/home/ubuntu/novac-merchantapi_previous_deployment" >> $GITHUB_ENV # Declared on page 145
+          # echo "ZIP_FILE=USSD-integrations-staging-2025-07-24-v38.zip" >> $GITHUB_ENV # This has been created on line 78
+          echo "SERVICE_NAME=novac-merchant-api.service" >> $GITHUB_ENV
+          echo "APP_HEALTH_URL=https://merchantprodapi.novacpayment.com/swagger/index.html" >> $GITHUB_ENV # Applicaton health endpoint
+          echo "MAX_RETRIES=3" >> $GITHUB_ENV
+          echo "SLEEP_SECONDS=5" >> $GITHUB_ENV
+          echo "SUCCESS=0" >> $GITHUB_ENV
+          echo "Environment variables saved to GITHUB_ENV"
+
+      - name: Set VERSION and ZIP_NAME
+        run: |
+          VERSION="$(date +'%Y-%m-%d')-v${{ github.run_number }}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "ZIP_NAME=${{ env.REPO_NAME }}-$VERSION.zip" >> $GITHUB_ENV
+
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish API Project
+        run: |
+          # Publish the .NET 8 API project targeting Linux with self-contained deployment
+          dotnet publish "${{ env.PROJECT_PATH }}" \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained true \
+            --output ./published
+
+          # Zip the contents of the published directory into a versioned zip file
+          cd published
+          zip -r "../${ZIP_NAME}" .
+
+      - name: Upload artifact to S3
+        run: |
+          aws s3 cp "${ZIP_NAME}" "s3://${S3_BUCKET}/${REPO_NAME}/${ENVIRONMENT}/${REPO_NAME}-${ENVIRONMENT}-${VERSION}.zip"
+
+
+      - name: Capture Current EB Version (Rollback Target)
+        id: get-prev-version
+        run: |
+          PREV_VERSION=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${EB_ENV_NAME}" \
+            --query "Environments[0].VersionLabel" \
+            --output text)
+      
+          echo "PREV_VERSION=$PREV_VERSION" >> $GITHUB_ENV
+          echo "Previous version: $PREV_VERSION"
+
+      - name: Pre-Deployment Health Check
+        run: |
+          HEALTH=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${EB_ENV_NAME}" \
+            --query "Environments[0].Health" \
+            --output text)
+      
+          echo "Current EB environment health: $HEALTH"
+      
+          if [[ "$HEALTH" != "ok" ]]; then
+            echo "Environment not healthy. Abort deployment."
+            exit 1
+          fi
+      
+      - name: Deploy to Elastic Beanstalk        
+        run: |
+          echo "Deploying to Elastic Beanstalk environment"
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+
+          VERSION_LABEL="${REPO_NAME}-${ENVIRONMENT}-${VERSION}"
+          echo "Version Label: $VERSION_LABEL"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name ${EB_APP_NAME} \
+            --version-label $VERSION_LABEL \
+            --source-bundle S3Bucket=${S3_BUCKET},S3Key=${REPO_NAME}/${ENVIRONMENT}/$VERSION_LABEL.zip
+
+          aws elasticbeanstalk update-environment \
+            --environment-name ${EB_ENV_NAME} \
+            --version-label $VERSION_LABEL
+
+      - name: Cleanup old Elastic Beanstalk versions (keep latest 20)
+        
+        run: |
+          aws elasticbeanstalk describe-application-versions \
+            --application-name ${EB_APP_NAME} \
+            --query 'ApplicationVersions[].[VersionLabel,DateCreated]' \
+            --output text \
+            | sort -k2 \
+            | head -n -20 \
+            | awk '{print $1}' \
+            | while read version; do
+                echo "Deleting old version: $version"
+                aws elasticbeanstalk delete-application-version \
+                  --application-name ${EB_APP_NAME} \
+                  --version-label "$version" \
+                  --delete-source-bundle || echo "Failed to delete $version (source bundle may not exist)"
+              done
+
+        - name: Post-Deployment Health Check & Auto-Rollback
+          run: |
+            echo "Waiting for Elastic Beanstalk environment to stabilize..."
+        
+            MAX_RETRIES=30
+            RETRY=0
+            SUCCESS=0
+        
+            while [[ $RETRY -lt $MAX_RETRIES ]]; do
+              HEALTH=$(aws elasticbeanstalk describe-environments \
+                --environment-names "${EB_ENV_NAME}" \
+                --query "Environments[0].Health" \
+                --output text)
+        
+              STATUS=$(aws elasticbeanstalk describe-environments \
+                --environment-names "${EB_ENV_NAME}" \
+                --query "Environments[0].Status" \
+                --output text)
+        
+              echo "Attempt $RETRY: Health=$HEALTH | Status=$STATUS"
+        
+              if [[ "$HEALTH" == "Green" && "$STATUS" == "Ready" ]]; then
+                echo "Deployment healthy!"
+                SUCCESS=1
+                break
+              fi
+        
+              if [[ "$HEALTH" == "Severe" || "$HEALTH" == "Degraded" ]]; then
+                echo "Environment unhealthy after deployment. Rolling back!"
+                aws elasticbeanstalk update-environment \
+                  --environment-name "${EB_ENV_NAME}" \
+                  --version-label "${PREV_VERSION}"
+                exit 1
+              fi
+        
+              sleep 10
+              RETRY=$((RETRY+1))
+            done
+        
+            if [[ $SUCCESS -eq 0 ]]; then
+              echo "Environment did not become healthy in time. Rolling back."
+              aws elasticbeanstalk update-environment \
+                --environment-name "${EB_ENV_NAME}" \
+                --version-label "${PREV_VERSION}"
+              exit 1
+            fi
