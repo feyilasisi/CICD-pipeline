@@ -10,7 +10,7 @@ on:
 
 jobs:
   run-ci:
-    uses: ./.github/workflows/CD-pipeline.yml
+    uses: ./.github/workflows/CI-pipeline.yml
     secrets:
       SONAR_TOKEN_MERCH_DASH_API: ${{ secrets.SONAR_TOKEN_MERCH_DASH_API }}
       SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
