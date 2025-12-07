@@ -1,0 +1,379 @@
+name: .NET Core DevSecOps CI Pipeline
+
+on:
+  pull_request:
+    branches:      
+      - staging_general
+
+  workflow_call:
+    secrets:
+      SONAR_TOKEN_MERCH_DASH_API:
+        required: true
+      SONARQUBE_URL:
+        required: true
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  TARGET_URL: "http://localhost:5000"
+
+jobs:
+  build-app:
+    name: Build Application
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        api:
+          - name: "FOLDER_1.Api"
+            csproj: "./companyMerchAdmin.Api/companyService.Api.csproj"
+            dll: "companyService.Api.dll"
+          - name: "FOLDER_2.Admin.Api"
+            csproj: "./companyService.Admin.Api/companyService.Admin.Api.csproj"
+            dll: "company_Service.Admin.Api.dll"
+          - name: "companyService.Mobile.Api"
+            csproj: "./companyService.Mobile.Api/companyService.Mobile.Api.csproj"
+            dll: "companyService.Mobile.Api.dll"
+      fail-fast: false # Continue other builds even if one fails
+
+    env:
+      PROJECT_PATH: ${{ matrix.api.csproj }}
+      DLL_NAME: ${{ matrix.api.dll }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: Build application
+        run: |
+          dotnet build ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --no-restore
+      - name: Unit test
+        run: dotnet test ${{ env.PROJECT_PATH }} --configuration Release --no-build
+
+      - name: Publish application
+        run: |
+          dotnet publish ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --output ./publish \
+            --no-build
+
+      - name: Upload published app as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.api.name }}
+          path: ./publish
+          retention-days: 1
+
+  OWASP-ZAP-DAST-base-scan:
+    needs: build-app
+    name: OWASP ZAP DAST Base Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        api:
+          - name: "companyMerchantAdmin.Api"
+            dll: "companyService.Api.dll"
+          - name: "companyService.Admin.Api"
+            dll: "companyService.Admin.Api.dll"
+          - name: "companyService.Mobile.Api"
+            dll: "companyService.Mobile.Api.dll"
+      fail-fast: false # Continue other scans even if one fails
+
+    env:
+      DLL_NAME: ${{ matrix.api.dll }}
+
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download published app
+        uses: actions/download-artifact@v4
+        with:
+          name: artifact-${{ matrix.api.name }}
+          path: ./publish
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Start application
+        run: |
+          cd publish
+          nohup dotnet ${{ env.DLL_NAME }} > ../app.log 2>&1 &
+          echo $! > ../app.pid
+          echo "Application PID: $(cat ../app.pid)"
+
+          # Wait for application to be ready
+          echo "Waiting for application to start..."
+          sleep 5
+
+          for i in {1..30}; do
+            if curl -f ${{ env.TARGET_URL }}/swagger/index.html 2>/dev/null || \
+               curl -f ${{ env.TARGET_URL }} 2>/dev/null; then
+              echo "Application is running!"
+              break
+            fi
+            echo "Attempt $i/30: Waiting..."
+            sleep 2
+          done
+
+      - name: Verify application is accessible
+        run: |
+          curl -v ${{ env.TARGET_URL }}/swagger/index.html 2>&1 | head -20 || echo "Connection check complete"
+
+      - name: Prepare workspace for ZAP
+        run: |
+          echo "Setting up permissions for ZAP reports..."
+          sudo chown -R $(whoami):$(whoami) ${{ github.workspace }}
+          sudo chmod -R 777 ${{ github.workspace }}
+
+      - name: Run OWASP ZAP Baseline Scan
+        id: zap-scan
+        continue-on-error: true # Allow report upload
+        run: |
+          docker run -v ${{ github.workspace }}:/zap/wrk/:rw \
+          --network=host \
+          ghcr.io/zaproxy/zaproxy:stable \
+          zap-baseline.py \
+          -t ${{ env.TARGET_URL }} \
+          -J report_json.json \
+          -w report_md.md \
+          -r report_html.html \
+          -a -j -l INFO
+
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Upload ZAP Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-reports-${{ matrix.api.name }}
+          path: |
+            report_html.html
+            report_md.md
+            report_json.json
+          if-no-files-found: warn
+
+      - name: Fail pipeline if ZAP found High/Medium severity alerts
+        if: always()
+        run: |
+          set -euo pipefail
+
+          REPORT="report_json.json"
+
+          if [ ! -f "$REPORT" ]; then
+          echo "ZAP JSON report not found at $REPORT"
+          exit 1
+          fi
+
+          # riskcodes High = 3 Medium = 2 Low = 1 Informational = 0. Fails when the riskcode is High or medium.
+          HIGH_COUNT=$(jq '[.site[]?.alerts[]? | select((.riskcode? == "3" or .riskcode? == "2") and (.falsePositive? // false | not))] | length' "$REPORT")
+          echo "ZAP high-severity alerts found: $HIGH_COUNT"
+
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+          echo "::error::Failing pipeline: $HIGH_COUNT high severity ZAP alert(s) detected."
+          exit 1
+          fi
+
+          echo "No High severity ZAP alerts. Continuing..."
+
+      - name: Display Report Summary
+        if: always()
+        run: |
+          echo "=================================="
+          echo "🔒 OWASP ZAP Scan Complete"
+          echo "=================================="
+
+          if [ -f report_md.md ]; then
+            echo ""
+            echo "📋 Scan Summary (from Markdown):"
+            head -50 report_md.md
+          fi
+
+          if [ -f report_json.json ]; then
+            echo ""
+            echo "📊 Alert Statistics:"
+            # Parse JSON to show alert counts by risk level
+            python3 -c "
+          import json
+          try:
+              with open('report_json.json', 'r') as f:
+                  data = json.load(f)
+              site = data.get('site', [{}])[0]
+              alerts = site.get('alerts', [])
+              
+              risk_counts = {'High': 0, 'Medium': 0, 'Low': 0, 'Informational': 0}
+              for alert in alerts:
+                  risk = alert.get('riskdesc', '').split()[0]
+                  if risk in risk_counts:
+                      risk_counts[risk] += 1
+              
+              print('  🔴 High Risk:', risk_counts['High'])
+              print('  🟠 Medium Risk:', risk_counts['Medium'])
+              print('  🟡 Low Risk:', risk_counts['Low'])
+              print('  ℹ️  Informational:', risk_counts['Informational'])
+              print('  📊 Total Alerts:', len(alerts))
+          except Exception as e:
+              print('  ⚠️  Could not parse JSON report')
+          " 2>/dev/null || echo "  ⚠️  JSON parsing not available"
+          fi
+
+          echo ""
+          echo "=================================="
+          echo "📦 Reports available as artifacts:"
+          echo "  - HTML Report (report_html.html)"
+          echo "  - JSON Report (report_json.json)"
+          echo "  - Markdown Report (report_md.md)"
+          echo "  - XML Report (report_xml.xml)"
+          echo "=================================="
+
+      - name: Stop application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            echo "Stopping application (PID: $(cat app.pid))"
+            kill $(cat app.pid) 2>/dev/null || true
+          fi
+          pkill -f "dotnet companyService.Api.dll" || true
+
+          echo "Application logs:"
+          cat app.log 2>/dev/null || echo "No logs found"
+
+    ################################################################
+
+  # Dependency scanning (Software Composition Analysis) using Trivy
+  Trivy-SCA-scan:
+    needs: build-app
+    name: Trivy - Software Composition Analysis Scan
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        api:
+          - "companyMerchantAdmin.Api"
+          - "companyService.Admin.Api"
+          - "companyService.Mobile.Api"
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download published app
+        uses: actions/download-artifact@v4
+        with:
+          name: artifact-${{ matrix.api }}
+          path: ./publish
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+          scanners: vuln # disables secret scanning
+          target: ./publish
+
+  #   Static Application Security Testing (SAST) using SonarQube
+
+  Sonarqube-SAST-scan:
+    needs: build-app
+    name: Sonarqube SAST Scan
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        api:
+          - name: "FOLDER_1.Api"
+            csproj: "./companyMerchAdmin.Api/companyService.Api.csproj"
+            sonar_key: "merchant-admin-api"
+          - name: "FOLDER_2.Admin.Api"
+            csproj: "./companyService.Admin.Api/companyService.Admin.Api.csproj"
+            sonar_key: "admin-api"
+          - name: "companyService.Mobile.Api"
+            csproj: "./companyService.Mobile.Api/companyService.Mobile.Api.csproj"
+            sonar_key: "mobile-api"
+      fail-fast: false # Continue other builds even if one fails
+
+    env:
+      PROJECT_PATH: ${{ matrix.api.csproj }}
+      DLL_NAME: ${{ matrix.api.dll }}
+      SONAR_KEY: ${{ matrix.api.sonar_key }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: |
+            echo "Restoring $proj..."
+            dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: Install SonarScanner for .NET
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Begin SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN_MERCH_DASH_API }}
+          SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"$PROJECT_PATH" \
+            /n:"$PROJECT_PATH" \
+            /d:sonar.login="$SONAR_TOKEN" \
+            /d:sonar.host.url="$SONARQUBE_URL" \
+            /d:sonar.qualitygate.wait=true
+
+      - name: Build project
+        run: |
+            echo "Building $proj..."
+            dotnet build ${{ env.PROJECT_PATH }} --no-restore --configuration Release || exit 1
+
+      - name: End SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN_MERCH_DASH_API }}
+        run: |
+          dotnet sonarscanner end \
+            /d:sonar.login="$SONAR_TOKEN"
+
+
