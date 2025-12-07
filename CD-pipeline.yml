@@ -4,8 +4,8 @@ name: Merchant Dashboard API CD
 on:
   push:
     branches:
-      - staging_merchant_dashboard
-      - main_merchant_dashboard
+      - staging
+      - main
       
 
 jobs:
@@ -25,16 +25,16 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      S3_BUCKET: novac-build-artifacts #constant
-      REPO_NAME: novac-merchant-API #for path to respective repo on s3
-      PROJECT_PATH: ./NovacMerchantAdmin.Api/NovacService.Api.csproj #var
-      MAIN_BRANCH: main_merchant_dashboard #vary per repo
-      STAGING_BRANCH: staging_merchant_dashboard #vary per repo
-      ENV_STAGE: staging #constant
-      ENV_PROD: prod #constant
-      EB_APP_NAME: novac-merchantapi-staging #vary per EB app name
-      EB_ENV_STAGE: Novac-merchantapi-staging-env #vary per EB environment name
-      EB_ENV_PROD: Novac-merchantapi-live-env #vary per EB environment name
+      S3_BUCKET: company-build-artifacts 
+      REPO_NAME: company-merchant-API 
+      PROJECT_PATH: ./companyMerchantAdmin.Api/companyService.Api.csproj
+      MAIN_BRANCH: main
+      STAGING_BRANCH: staging
+      ENV_STAGE: staging
+      ENV_PROD: prod
+      EB_APP_NAME: company-merchantapi-staging
+      EB_ENV_STAGE: company-merchantapi-staging-env
+      EB_ENV_PROD: company-merchantapi-live-env
 
     steps:
       - name: Checkout code
@@ -57,16 +57,6 @@ jobs:
             echo "ENVIRONMENT=$ENV_STAGE" >> $GITHUB_ENV
             echo "EB_ENV_NAME=$EB_ENV_STAGE" >> $GITHUB_ENV
           fi
-
-          echo "APP_DIR=/home/ubuntu/novac-merchantapi" >> $GITHUB_ENV
-          # echo "PREV_DIR=/home/ubuntu/novac-merchantapi_previous_deployment" >> $GITHUB_ENV # Declared on page 145
-          # echo "ZIP_FILE=USSD-integrations-staging-2025-07-24-v38.zip" >> $GITHUB_ENV # This has been created on line 78
-          echo "SERVICE_NAME=novac-merchant-api.service" >> $GITHUB_ENV
-          echo "APP_HEALTH_URL=https://merchantprodapi.novacpayment.com/swagger/index.html" >> $GITHUB_ENV # Applicaton health endpoint
-          echo "MAX_RETRIES=3" >> $GITHUB_ENV
-          echo "SLEEP_SECONDS=5" >> $GITHUB_ENV
-          echo "SUCCESS=0" >> $GITHUB_ENV
-          echo "Environment variables saved to GITHUB_ENV"
 
       - name: Set VERSION and ZIP_NAME
         run: |
@@ -180,7 +170,7 @@ jobs:
         
               echo "Attempt $RETRY: Health=$HEALTH | Status=$STATUS"
         
-              if [[ "$HEALTH" == "Green" && "$STATUS" == "Ready" ]]; then
+              if [[ "$HEALTH" == "ok" && "$STATUS" == "Ready" ]]; then
                 echo "Deployment healthy!"
                 SUCCESS=1
                 break
